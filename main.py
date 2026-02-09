@@ -1,6 +1,6 @@
 from utils import *
 from model import *
-from upload import *
+# from upload import *  # Commented out - Firebase upload not needed for local use
 
 def get_info():
     """
@@ -128,7 +128,12 @@ def Run(Boundary, front_door, room_centroids, bathroom_centroids, kitchen_centro
     #=========================================================================
     # Model
     # model_path = r"D:\Grad\Best models\v2\Best_model_V2.pt"
-    model_path = r"D:\Grad\Best models\v3_UnScalled\Best_model_V3.pt"
+    # Use the model path relative to the project directory
+    model_path = os.path.join(os.path.dirname(__file__), "GAT-Net_model/checkpoints/GAT-Net_v3_UnScalled.pt")
+    
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found at: {model_path}\nPlease ensure the model file exists in GAT-Net_model/checkpoints/")
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = load_model(model_path, device)

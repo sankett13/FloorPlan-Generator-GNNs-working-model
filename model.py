@@ -108,9 +108,30 @@ def load_model(checkpoint_path, device):
     model = GATNet(9, 3)
     model = model.to(device)
     
-    checkpoint = torch.load(checkpoint_path)
+    # Load checkpoint with CPU mapping if CUDA is not available
+    if device.type == 'cpu':
+        checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+    else:
+        checkpoint = torch.load(checkpoint_path)
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Handle PyTorch Geometric version compatibility
+    # Old versions used lin_src and lin_dst, new versions use lin
+    state_dict = checkpoint['model_state_dict']
+    new_state_dict = {}
+    
+    for key, value in state_dict.items():
+        # Convert old GATConv format (lin_src/lin_dst) to new format (lin)
+        if 'lin_src.weight' in key:
+            # Use lin_src weights for the unified lin layer
+            new_key = key.replace('lin_src.weight', 'lin.weight')
+            new_state_dict[new_key] = value
+        elif 'lin_src.bias' in key:
+            new_key = key.replace('lin_src.bias', 'lin.bias')
+            new_state_dict[new_key] = value
+        elif 'lin_dst' not in key:  # Skip lin_dst entirely
+            new_state_dict[key] = value
+    
+    model.load_state_dict(new_state_dict)
     model.eval()
     
     return model
