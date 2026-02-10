@@ -18,6 +18,8 @@ import os
 from model import load_model, GATNet
 from utils import centroids_to_graph, Handling_dubplicated_nodes, scale
 import shapely.wkt
+# New geometry solver for constrained layout
+from geometry_solver import solve_layout, OverConstrainedLayoutError
 
 class GATNetFloorPlanGenerator:
     """
@@ -131,11 +133,16 @@ class GATNetFloorPlanGenerator:
             centroids, dimensions
         )
         
-        # STEP 6: Correct overlaps using separation steering
-        print("  📐 Correcting room overlaps...")
-        centroids, dimensions = self._correct_overlaps(
-            centroids, dimensions, boundary
-        )
+        # STEP 6: Correct overlaps using constrained geometry solver
+        print("  📐 Correcting room overlaps with constrained solver...")
+        try:
+            centroids, dimensions = self._correct_overlaps(
+                centroids, dimensions, boundary
+            )
+        except OverConstrainedLayoutError as e:
+            # Solver failed to converge to a feasible layout
+            print(f"❌ Layout solver failure: {e}")
+            return {"error": str(e)}
         
         # STEP 6.5: Apply architectural constraints (walls, doors, circulation)
         print("  🏛️  Applying architectural constraints...")
@@ -371,46 +378,164 @@ class GATNetFloorPlanGenerator:
     
     def _correct_overlaps(self, centroids, dimensions, boundary):
         """
-        Use Guillotine/Box Packing algorithm to ensure NO overlaps
+        Replace rigid guillotine packing with constrained geometry solver.
+
+        Strategy:
+        - Flatten rooms into unique ids.
+        - Build target_sizes mapping and adjacency graph from nearby centroids.
+        - Run multiple randomized solver restarts and score results using
+          sunlight and plumbing cost. Keep the best layout.
+        - If solver returns but overlaps remain, fall back to guillotine packing.
+        - If solver fails to converge (raises OverConstrainedLayoutError), propagate.
         """
         width = boundary["width"]
         height = boundary["height"]
-        
-        print("    🔧 Applying Guillotine Box Packing...")
-        
-        # Collect all rooms with their dimensions and priorities
-        rooms_to_place = []
+
+        # Build flat lists and mappings
+        ids = []
+        id_to_room = []  # tuples (room_type, idx)
+        initial_centroids = {}
+        target_sizes = {}
+
         for room_type, centroid_list in centroids.items():
-            priority = self._get_placement_priority(room_type)
             for i, centroid in enumerate(centroid_list):
+                rid = f"{room_type}#{i}"
+                ids.append(rid)
+                id_to_room.append((room_type, i))
+                initial_centroids[rid] = np.array(centroid, dtype=float)
                 dims = dimensions[room_type][i]
-                rooms_to_place.append({
-                    'type': room_type,
-                    'index': i,
-                    'width': dims['width'],
-                    'height': dims['height'],
-                    'area': dims['area'],
-                    'priority': priority,
-                    'original_centroid': centroid
-                })
-        
-        # Sort by priority (higher priority placed first)
-        rooms_to_place.sort(key=lambda x: (-x['priority'], -x['area']))
-        
-        # Use Guillotine packing algorithm
-        new_positions = self._guillotine_pack(rooms_to_place, width, height)
-        
-        # Update centroids with packed positions
-        for room_info, position in zip(rooms_to_place, new_positions):
-            room_type = room_info['type']
-            room_idx = room_info['index']
-            
-            # Find this room in the centroids dict
-            centroids[room_type][room_idx] = (position['x'], position['y'])
-        
-        print(f"    ✓ Successfully packed {len(rooms_to_place)} rooms with NO overlaps")
-        
-        return centroids, dimensions
+                target_sizes[rid] = (dims['width'], dims['height'])
+
+        # Build adjacency intent graph from proximity of initial centroids
+        G_adj = nx.Graph()
+        for rid in ids:
+            G_adj.add_node(rid)
+
+        # connect nodes whose centroids are within a reasonable proximity
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a = initial_centroids[ids[i]]
+                b = initial_centroids[ids[j]]
+                dist = np.linalg.norm(a - b)
+                # threshold: average target size diagonal
+                avg_w = 0.5 * (target_sizes[ids[i]][0] + target_sizes[ids[j]][0])
+                avg_h = 0.5 * (target_sizes[ids[i]][1] + target_sizes[ids[j]][1])
+                diag = np.sqrt(avg_w * avg_w + avg_h * avg_h)
+                if dist <= max(1.2 * diag, 1.0):
+                    G_adj.add_edge(ids[i], ids[j])
+
+        # Multi-start solver
+        best_layout = None
+        best_score = -np.inf
+        tried = 0
+        N = 10
+        K = 3
+
+        for trial in range(N):
+            tried += 1
+            # jitter initial centroids
+            jittered = {rid: (initial_centroids[rid] + np.random.uniform(-0.5, 0.5, size=2)).tolist()
+                        for rid in ids}
+
+            try:
+                polys = solve_layout(jittered, target_sizes, G_adj, (width, height), max_iter=300)
+            except OverConstrainedLayoutError:
+                # propagate solver failure up to top-level (generate_floor_plan will catch)
+                raise
+
+            # convert polys back to centroids/dimensions
+            cand_centroids = {}
+            cand_dimensions = {}
+            for rid, poly in polys.items():
+                room_type, idx = id_to_room[ids.index(rid)]
+                cx = poly.centroid.x
+                cy = poly.centroid.y
+                w = poly.bounds[2] - poly.bounds[0]
+                h = poly.bounds[3] - poly.bounds[1]
+
+                cand_centroids.setdefault(room_type, []).append((cx, cy))
+                cand_dimensions.setdefault(room_type, []).append({'width': w, 'height': h, 'area': w * h})
+
+            # Compute scores
+            _, sunlight_score = self._optimize_sunlight(cand_centroids, (0, 1), boundary)
+            _, plumbing_cost = self._optimize_plumbing(cand_centroids, cand_dimensions)
+
+            score = 0.5 * sunlight_score - 0.5 * (plumbing_cost / 100.0)
+
+            if score > best_score:
+                best_score = score
+                best_layout = (cand_centroids, cand_dimensions, polys)
+
+        # If no layout found (shouldn't happen), fallback
+        if best_layout is None:
+            print("    ⚠️  Solver produced no layout; falling back to guillotine packing.")
+            # reuse old guillotine behavior
+            rooms_to_place = []
+            for room_type, centroid_list in centroids.items():
+                priority = self._get_placement_priority(room_type)
+                for i, centroid in enumerate(centroid_list):
+                    dims = dimensions[room_type][i]
+                    rooms_to_place.append({
+                        'type': room_type,
+                        'index': i,
+                        'width': dims['width'],
+                        'height': dims['height'],
+                        'area': dims['area'],
+                        'priority': priority,
+                        'original_centroid': centroid
+                    })
+
+            rooms_to_place.sort(key=lambda x: (-x['priority'], -x['area']))
+            new_positions = self._guillotine_pack(rooms_to_place, width, height)
+            for room_info, position in zip(rooms_to_place, new_positions):
+                room_type = room_info['type']
+                room_idx = room_info['index']
+                centroids[room_type][room_idx] = (position['x'], position['y'])
+
+            return centroids, dimensions
+
+        # Use best layout
+        cand_centroids, cand_dimensions, cand_polys = best_layout
+
+        # Validate no overlaps; if overlap remains, fallback to guillotine
+        overlap_area = 0.0
+        for a in cand_polys.values():
+            for b in cand_polys.values():
+                if a == b:
+                    continue
+                inter = a.intersection(b)
+                if not inter.is_empty:
+                    overlap_area += inter.area
+
+        if overlap_area > 1e-3:
+            print("    ⚠️  Solver returned layout with residual overlaps; falling back to guillotine packing.")
+            rooms_to_place = []
+            for room_type, centroid_list in centroids.items():
+                priority = self._get_placement_priority(room_type)
+                for i, centroid in enumerate(centroid_list):
+                    dims = dimensions[room_type][i]
+                    rooms_to_place.append({
+                        'type': room_type,
+                        'index': i,
+                        'width': dims['width'],
+                        'height': dims['height'],
+                        'area': dims['area'],
+                        'priority': priority,
+                        'original_centroid': centroid
+                    })
+
+            rooms_to_place.sort(key=lambda x: (-x['priority'], -x['area']))
+            new_positions = self._guillotine_pack(rooms_to_place, width, height)
+            for room_info, position in zip(rooms_to_place, new_positions):
+                room_type = room_info['type']
+                room_idx = room_info['index']
+                centroids[room_type][room_idx] = (position['x'], position['y'])
+
+            return centroids, dimensions
+
+        # Otherwise accept solver layout
+        print(f"    ✓ Solver produced layout (overlap_area={overlap_area:.3f}). Using optimized layout.")
+        return cand_centroids, cand_dimensions
     
     def _get_placement_priority(self, room_type):
         """Get placement priority (higher = placed first)"""
